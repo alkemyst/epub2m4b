@@ -1,0 +1,6 @@
+venv-cb
+.claude
+references/*
+*.epub
+*.jsonl
+__pycache__
