@@ -1,25 +1,93 @@
-# Da EPUB a WAV
+# Da EPUB ad audiolibro
 
-Pipeline in due passi: l'EPUB diventa un JSONL di segmenti di testo, il JSONL
-diventa un WAV per segmento piu' un `manifest.jsonl`. L'assemblaggio finale in
-M4B non e' ancora scritto (vedi in fondo).
+Pipeline in tre passi: l'EPUB diventa un JSONL di segmenti di testo, il JSONL
+diventa un WAV per segmento piu' un `manifest.jsonl`, e il manifest diventa un
+M4B con capitoli, copertina e metadata.
 
-## Ambiente
-
-```bash
-cd /home/claude/chatterbox
-source venv-cb/bin/activate
+```
+                      references/ref.wav          (passo 0, una volta sola)
+                              |
+libro.epub  ->  libro.jsonl  -+->  audio_libro/*.wav + manifest.jsonl  ->  libro.m4b
+            1                 2                                        3
 ```
 
-Controllo rapido che il venv sia sano:
+Manca ancora la normalizzazione di loudness: il volume puo' variare fra un
+segmento e l'altro. E' un rinvio consapevole, vedi `CLAUDE.md`.
+
+## Gli script
+
+| script | fa |
+|---|---|
+| `prepara_ref.py` | registrazione -> voce di riferimento normalizzata |
+| `epub_to_jsonl.py` | EPUB -> JSONL di segmenti di testo |
+| `tts_chatterbox.py` | JSONL -> un WAV per segmento, riprendibile |
+| `assembla_m4b.py` | WAV + manifest -> M4B con capitoli e copertina |
+
+`eccezioni.json` e' il dizionario di respelling, applicato prima della sintesi.
+
+## Uso quotidiano
 
 ```bash
+cd ~/Local/epub2m4b
+source venv-cb/bin/activate
 python -c "import torch, chatterbox; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Deve stampare `2.6.0+cu124 True`. Se dice `ModuleNotFoundError` o parte il
-Python di sistema invece del 3.11, il venv e' scollegato dal suo interprete:
-vedi "Se sposti il progetto" in fondo.
+Deve stampare la versione di torch e `True`. Se dice `ModuleNotFoundError` o
+parte il Python di sistema invece del 3.11, il venv e' scollegato dal suo
+interprete: vedi "Se sposti il progetto" in fondo.
+
+Per installare da zero, vedi "Setup da zero" alla fine.
+
+## Passo 0: la voce di riferimento
+
+Chatterbox clona la voce da un singolo WAV di pochi secondi. Serve prima di
+tutto il resto, perche' senza non si sintetizza niente.
+
+```bash
+python prepara_ref.py registrazione.wav -o references/ref_nuova.wav \
+    --da 1:24 --durata 8
+```
+
+Ritaglia 8 secondi a partire da 1:24, converte in mono 48kHz e normalizza la
+loudness con `loudnorm` a due passate. Accetta qualsiasi sorgente che ffmpeg
+sappia aprire, video compresi.
+
+### Come scegliere il pezzo
+
+Il taglio conta piu' di quanto sembri, perche' Chatterbox non usa tutto il
+riferimento allo stesso modo:
+
+- i **primi 6 secondi** alimentano i token di prompt, quelli che portano
+  prosodia e timbro (`ENC_COND_LEN = 6 * 16000`);
+- i **primi 10 secondi** alimentano il decoder (`DEC_COND_LEN = 10 * 24000`);
+- il **file intero** alimenta l'embedding di speaker.
+
+Conseguenze pratiche. Sotto i 6 secondi la voce resta poco caratterizzata.
+Oltre i 10 l'audio in piu' influenza solo l'embedding, quindi allungare non
+serve. E soprattutto: **i primi 6 secondi devono essere la parte migliore**,
+non un respiro o un attacco incerto. Siccome pero' l'embedding legge fino in
+fondo, anche la coda va pulita: silenzio, rumore o una seconda voce alla fine
+sporcano il risultato lo stesso.
+
+Il resto sono le solite cose: un solo parlante, niente musica o riverbero,
+tono uguale a quello che vuoi in lettura, frasi intere e non parole isolate.
+
+### Sceglierla a orecchio
+
+La qualita' di un riferimento non si giudica dal file ma dal risultato, quindi
+conviene preparare piu' candidati e sintetizzare lo stesso passaggio con
+ognuno:
+
+```bash
+for v in references/ref_*.wav; do
+  python tts_chatterbox.py libro.jsonl -o /tmp/voce_$(basename $v .wav) -r "$v" -n 5
+done
+```
+
+Normalizzando tutti i candidati allo stesso target si evita che a orecchio
+vinca semplicemente il piu' forte. Quello che convince diventa il default di
+`tts_chatterbox.py` (`-r`), oggi `references/ref_stefano_buendia.wav`.
 
 ## Passo 1: EPUB -> JSONL
 
@@ -112,6 +180,8 @@ Flag utili:
 | `--temperature` | 0.6 | varianza |
 | `-c`, `--chapter` | tutti | genera solo questo capitolo |
 | `-n`, `--limite` | nessuno | genera al massimo N segmenti |
+| `--solo-id` | | rigenera solo questi id, scavalcando la cache |
+| `--solo-sospetti` | | rigenera gli id marcati `sospetto` nel manifest |
 | `--force` | | rigenera tutto ignorando il manifest |
 
 ### Ripresa e cache
@@ -143,11 +213,240 @@ grep -c '"sospetto": true' audio_libro/manifest.jsonl
 Se ce ne sono molti, la contromisura sarebbe alzare `repetition_penalty` a
 2.2-2.5, ma quel parametro **non e' ancora esposto** dallo script.
 
+### Rifare i segmenti venuti male
+
+Un segmento puo' venire male per due motivi, e si correggono in modo diverso.
+
+**Il testo e' problematico** (sigla, nome proprio, punteggiatura strana):
+correggi il testo nel JSONL o aggiungi una regola a `eccezioni.json`. La firma
+cambia da sola e al lancio successivo si rigenera solo quel segmento. Non serve
+nessun flag.
+
+**Il testo va bene, e' uscita male la generazione:** la sintesi ha
+`temperature=0.6`, quindi e' stocastica e a volte basta ritirare i dadi. Ma la
+firma non cambia, quindi la cache non lo rifarebbe mai. Serve dirlo esplicito:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o audio_libro --solo-id ch13_0207,ch07_0044
+```
+
+Rigenera solo quegli id ignorando la cache, e lascia intatto tutto il resto.
+Ripetibile: rilanciando si ritirano di nuovo i dadi finche' non esce pulito.
+
+Per lavorare sull'intera lista dei sospetti senza copiarla a mano:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o audio_libro --solo-sospetti
+```
+
+Se la lista e' lunga e vuoi sceglierne solo alcuni, `--solo-id` accetta anche un
+file, dove il cancelletto commenta fino a fine riga:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o audio_libro --solo-id @da_rifare.txt
+```
+
+```
+# incollato dall'output di assembla_m4b.py
+ch13_0207     # troncato a meta'
+ch07_0044
+```
+
+**Non usare `-c 13 --force` per rifare qualche segmento del capitolo 13.**
+Rigenera tutti e 333 i segmenti, e siccome la sintesi e' stocastica ritira i
+dadi anche su quelli che erano venuti bene: un capitolo gia' validato puo'
+tornare indietro peggiore. Nota che `-c 13` da solo invece non fa niente, perche'
+il filtro per capitolo agisce prima del controllo di cache.
+
+Le righe rigenerate si accodano al manifest e vincono sulle precedenti, quindi
+`assembla_m4b.py` prende le durate nuove al prossimo assemblaggio senza altri
+passaggi.
+
 ## Passo 3: WAV -> M4B
 
-Non ancora disponibile. `assembla_m4b.py` e' da scrivere, la specifica sta in
-`CLAUDE.md`. Per ora il prodotto della pipeline sono i WAV per segmento piu'
-il manifest.
+Prima un giro a vuoto, per vedere capitoli e durate senza aspettare la codifica:
+
+```bash
+python assembla_m4b.py audio_libro/manifest.jsonl -o libro.m4b \
+    --epub "libro.epub" --dry-run
+```
+
+Stampa titolo, autore, copertina trovata e l'istante di inizio di ogni capitolo.
+Se i confini tornano, togli `--dry-run`:
+
+```bash
+python assembla_m4b.py audio_libro/manifest.jsonl -o libro.m4b --epub "libro.epub"
+```
+
+`--epub` serve solo a pescare titolo, autore e copertina: titolo e autore dal
+Dublin Core, la copertina da `ITEM_COVER` con fallback su `<meta name="cover">`
+e poi su un'immagine chiamata "cover". Se l'EPUB e' incompleto o vuoi
+sovrascrivere, ci sono `--titolo`, `--autore` e `--copertina`.
+
+Flag utili:
+
+| flag | default | cosa fa |
+|---|---|---|
+| `-o`, `--out` | `audiolibro.m4b` | file di uscita |
+| `-j`, `--jsonl` | | JSONL di partenza, serve solo con i manifest vecchi (vedi sotto) |
+| `--epub` | | da cui prendere titolo, autore e copertina |
+| `--titolo`, `--autore`, `--copertina` | | sovrascrivono quel che viene dall'EPUB |
+| `--narratore` | `Chatterbox IT, voce clonata` | finisce in `composer` e `comment` |
+| `--bitrate` | `64k` | bitrate AAC |
+| `--dry-run` | | prepara capitoli e lista senza codificare |
+
+### Pause e capitoli
+
+Fra un segmento e il successivo viene inserito un silenzio: 300ms di norma,
+800ms dopo un segmento con `fine_paragrafo`, 1200ms a cambio capitolo. Il
+silenzio di stacco e' conteggiato in coda al capitolo che si chiude, cosi' i
+capitoli sono contigui e non restano buchi.
+
+I titoli dei capitoli vengono dal campo `titolo`, quindi tipicamente
+"Capitolo 1", "Capitolo 2", generati al passo 1.
+
+### Se il manifest e' vecchio
+
+I manifest generati prima dell'aggiunta di `titolo` e `fine_paragrafo` non
+hanno i dati per le pause e per i titoli. Lo script se ne accorge e chiede il
+JSONL di partenza:
+
+```bash
+python assembla_m4b.py audio_libro/manifest.jsonl -o libro.m4b -j libro.jsonl
+```
+
+Non serve rigenerare l'audio: i due campi non entrano nella firma di cache.
+
+### Verifica finale
+
+A fine codifica lo script confronta la durata reale del file con quella attesa
+(parlato piu' pause). Oltre l'1% di scarto stampa un avviso ed esce con codice
+1, perche' di solito vuol dire che manca dell'audio. Subito dopo elenca i
+segmenti `sospetto` con id, durata e testo: non bloccano l'assemblaggio, ma
+vanno riascoltati prima di considerare il libro finito.
+
+Il file esce AAC mono 24kHz, con copertina incorporata e `media_type=2`, che e'
+il tag che fa comparire il file come audiolibro invece che come musica.
+
+**Nota:** manca ancora la normalizzazione di loudness, quindi il volume puo'
+variare fra un segmento e l'altro. E' un rinvio consapevole, non un bug.
+
+## Setup da zero
+
+Testato su Ubuntu con Python di sistema 3.14 e GTX 1660 Ti (Turing, sm_75),
+driver 580.
+
+### 1. Prerequisiti di sistema
+
+```bash
+sudo apt install ffmpeg
+python3 -V
+```
+
+`ffmpeg` serve a `prepara_ref.py` e ad `assembla_m4b.py`, e non passa da pip.
+
+Se il Python di sistema e' 3.13 o piu' recente, **non usarlo**: torch pubblica
+le ruote per le versioni nuove con mesi di ritardo, e le dipendenze di
+chatterbox (transformers, numpy pinnato, librosa, s3tokenizer) non si risolvono.
+Serve un 3.11 a fianco, senza toccare il sistema.
+
+### 2. Python 3.11 e venv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.11
+cd ~/Local/epub2m4b
+uv venv --python 3.11 venv-cb
+source venv-cb/bin/activate
+python -V        # deve dire 3.11.x
+```
+
+Due trappole di `uv`:
+
+- cerca automaticamente una dir chiamata `.venv`. Questa si chiama `venv-cb`,
+  quindi va tenuta attivata (uv rispetta `VIRTUAL_ENV`) oppure va passato ogni
+  volta `--python venv-cb/bin/python`. Se te ne dimentichi, uv usa o crea un
+  altro ambiente senza dirtelo in modo evidente.
+- `uv venv` non installa `pip` dentro il venv. O usi `uv pip install` al posto
+  di `pip install` per tutto (piu' veloce nella risoluzione), oppure
+  `uv pip install pip` una volta e poi usi pip normalmente.
+
+### 3. Torch con CUDA, prima di tutto il resto
+
+```bash
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Deve stampare `True` e il nome della GPU. Se stampa `False` ti e' arrivata la
+build CPU e non ha senso proseguire.
+
+Va installato **per primo**: chatterbox pinna torch, transformers e numpy, e se
+lo lasci risolvere a lui puo' tirarsi dentro una ruota CPU.
+
+### 4. Chatterbox
+
+```bash
+uv pip install chatterbox-tts
+```
+
+Poi verifica subito le due cose che possono essersi rotte:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+python -c "from chatterbox.mtl_tts import ChatterboxMultilingualTTS as M; import inspect; print('t3_model' in inspect.signature(M.from_pretrained).parameters)"
+```
+
+La prima deve essere ancora `True`. Se la risoluzione ha sostituito torch con
+la build CPU, ripeti il punto 3 con `--force-reinstall`.
+
+La seconda e' quella che conta per questi script, che chiamano
+`from_pretrained(..., t3_model="v3")`. Il multilingue V3 e' recente e la ruota
+su PyPI puo' essere indietro. Se stampa `False`, installa dal sorgente:
+
+```bash
+uv pip install "git+https://github.com/resemble-ai/chatterbox.git"
+```
+
+### 5. Il resto della pipeline
+
+```bash
+uv pip install ebooklib beautifulsoup4 lxml
+```
+
+### 6. Prova a vuoto
+
+Prima di lanciare migliaia di segmenti, un giro corto che scarica i pesi e
+scrive qualche WAV:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o /tmp/prova -n 3
+```
+
+I pesi arrivano da Hugging Face, sono qualche GB e finiscono in
+`~/.cache/huggingface`: la prima esecuzione e' lenta a prescindere dalla GPU.
+
+### 7. Congelare
+
+```bash
+uv pip freeze > requirements.txt
+```
+
+Il freeze **non conserva l'index-url di torch**: sulla macchina successiva rifai
+il punto 3 a mano e solo dopo `uv pip install -r requirements.txt`.
+
+### Note
+
+Con 6 GB di VRAM il modello multilingue ci sta ma e' al limite. Se compare un
+OOM a meta' di una sessione lunga:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+Non serve pinnare `setuptools<81`: era necessario quando `perth` importava
+`pkg_resources`, ma `resemble-perth 1.0.1` non lo fa piu' e il watermarker gira
+con setuptools 84.
 
 ## Se sposti il progetto
 

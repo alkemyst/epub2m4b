@@ -6,15 +6,22 @@ Pipeline EPUB -> audiolibro in italiano, TTS con Chatterbox Multilingual V3
 capitoli lunghi.
 
 ## Stato attuale
+- `prepara_ref.py`: registrazione -> voce di riferimento mono 48kHz normalizzata
+  (funzionante). Avvisa se il taglio esce dalla finestra utile 6-10s.
 - `epub_to_jsonl.py`: EPUB -> JSONL di segmenti (funzionante, testato su EPUB reale).
   Flag `--lista-capitoli` (tabella dei capitoli, non scrive) e `--salta-capitoli 1-4,29,30`
   (esclude front e back matter). Riconosce le intestazioni numerate: `titolo` diventa
   "Capitolo 1" per l'M4B mentre il testo letto diventa "Capitolo uno.", perché dare `1.`
   da solo in pasto al TTS produce troncamenti.
-- `tts_chatterbox.py`: JSONL -> WAV per segmento + manifest.jsonl riprendibile (funzionante)
+- `tts_chatterbox.py`: JSONL -> WAV per segmento + manifest.jsonl riprendibile (funzionante).
+  Il manifest porta anche `titolo` e `fine_paragrafo`, che servono all'assemblaggio.
+  `--solo-id` e `--solo-sospetti` rigenerano singoli segmenti scavalcando la cache.
+- `assembla_m4b.py`: manifest + WAV -> M4B con capitoli, copertina e metadata
+  (funzionante, provato su audio sintetico). Ha `--dry-run` per vedere i confini
+  dei capitoli senza codificare.
 - `eccezioni.json`: dizionario respelling (ADHD -> "addì accadì", ecc.), applicato prima della sintesi
-- `README.md`: comandi per girare la conversione EPUB -> WAV
-- Assemblaggio finale in M4B: **da scrivere**
+- `README.md`: comandi per girare la conversione, dall'EPUB all'M4B
+- Normalizzazione di loudness: **rinviata**, vedi "Cosa manca"
 - Controllo qualità automatico (Whisper su ogni segmento): **da scrivere**
 
 ### Scelta di progetto: gli id non si rinumerano
@@ -26,9 +33,18 @@ audio già buono. La numerazione con buchi non si vede nel prodotto finale, perc
 
 ## Ambiente
 - `venv-cb` (Python 3.11, uv), GPU GTX 1660 Ti 6GB, niente Tensor Core
-- `setuptools<81` necessario per `pkg_resources` (dipendenza di `perth`)
-- Chatterbox installato da GitHub (`t3_model="v3"` non è ancora su PyPI)
-- Riferimento vocale: `ref_stefano_buendia.wav`, mono 48kHz, 6-10s, normalizzato con `loudnorm`
+- Il Python di sistema è 3.14, troppo avanti per torch e per le dipendenze di
+  chatterbox: il 3.11 va installato con `uv python install 3.11`
+- torch va installato **prima** di chatterbox, dall'index `cu126`, altrimenti la
+  risoluzione può sostituirlo con la build CPU
+- Chatterbox: provare PyPI, e passare al git solo se `from_pretrained` non
+  accetta `t3_model` (il multilingue V3 è recente)
+- ~~`setuptools<81` per `pkg_resources`~~: **non serve più**. `resemble-perth 1.0.1`
+  non importa `pkg_resources`, verificato istanziando il watermarker con
+  setuptools 84. Non reintrodurre il pin.
+- Riferimento vocale: `ref_stefano_buendia.wav`, mono 48kHz, 6-10s, normalizzato
+  con `loudnorm`. Si prepara con `prepara_ref.py`.
+- Procedura di installazione completa in `README.md`, sezione "Setup da zero"
 
 ## Parametri Chatterbox di partenza
 `language_id="it"`, `exaggeration=0.65`, `cfg_weight=0.5`, `temperature=0.6`,
@@ -41,71 +57,87 @@ applicabile. Vedi "Cosa manca".
 
 ## Cosa manca per avere un audiolibro
 
-La pipeline oggi arriva a "un WAV per segmento piu' `manifest.jsonl`". Da li' a un
-M4B ascoltabile mancano queste cose, in ordine di quanto bloccano.
-
-**Bloccanti**
-
-1. `assembla_m4b.py`: non esiste. Specifica qui sotto.
-2. Metadata del libro: `epub_to_jsonl.py` non estrae titolo e autore dall'EPUB,
-   e non li scrive nel JSONL. Servono all'M4B. Da prendere da
-   `libro.get_metadata("DC", "title")` e `"creator"`.
-3. Copertina: non estratta. Sta nell'EPUB come `ITEM_COVER` o come `ITEM_IMAGE`
-   referenziata nel manifest OPF. Va salvata su file per darla a ffmpeg.
+La pipeline oggi arriva fino all'M4B. Restano aperte queste cose, in ordine di
+quanto pesano sul risultato.
 
 **Qualità dell'audio**
 
-4. Normalizzazione di loudness: nessuno step la applica. I segmenti escono a
-   volume variabile e vanno uniformati prima o durante l'assemblaggio, con
-   `loudnorm` a due passate. Target audiolibro: circa -19 LUFS mono.
-5. `repetition_penalty` non e' esposto da `tts_chatterbox.py` ne' passato a
+1. Normalizzazione di loudness: **rinviata per scelta esplicita**, non
+   dimenticata. I segmenti escono a volume variabile e vanno uniformati con
+   `loudnorm` a due passate, target circa -19 LUFS mono. Da decidere se
+   applicarla per segmento durante il TTS (piu' semplice da riprendere) o in
+   un passaggio unico sul concatenato (loudness piu' uniforme, ma due passate
+   su tutto il libro).
+2. `repetition_penalty` non e' esposto da `tts_chatterbox.py` ne' passato a
    `model.generate()`. E' il rimedio documentato contro i troncamenti forzati,
    quindi oggi quel consiglio non e' applicabile. Aggiungere il flag.
-6. Rigenerazione mirata: si puo' filtrare per capitolo (`-c`) o per numero
-   (`-n`), ma non per id. Per rifare i singoli segmenti marcati `sospetto`
-   bisogna editare a mano il manifest. Serve un `--solo-id ch07_0123,...`.
+3. ~~Rigenerazione mirata~~: fatta, `--solo-id` e `--solo-sospetti` in
+   `tts_chatterbox.py`. Vedi sotto.
 
 **Controllo qualità**
 
-7. QC con Whisper: trascrivere ogni WAV e confrontare con il testo di partenza
+4. QC con Whisper: trascrivere ogni WAV e confrontare con il testo di partenza
    (distanza di edit normalizzata). E' l'unico modo per beccare le allucinazioni
    e i troncamenti che la sola durata non vede. Il flag `sospetto` attuale e'
    solo un'euristica su durata attesa contro durata reale.
-8. Segmenti brevi: restano una sessantina di battute di dialogo sotto i 10
+5. Segmenti brevi: restano una sessantina di battute di dialogo sotto i 10
    caratteri (`- Eh?`). Sono corrette e non vanno accorpate, ma sono il caso
    peggiore per Chatterbox: da tenere d'occhio nel QC.
 
 **Igiene**
 
-9. `eccezioni.json` e' unico e globale, mentre il respelling e' per libro
+6. `eccezioni.json` e' unico e globale, mentre il respelling e' per libro
    (nomi propri, sigle). Andrebbe affiancato un file per titolo.
-10. Il trattino di dialogo negli EPUB italiani e' spesso un en dash. Non e'
-    verificato come lo vocalizzi Chatterbox: da controllare in ascolto, e in
-    caso togliere via `eccezioni.json`.
+7. Il trattino di dialogo negli EPUB italiani e' spesso un en dash. Non e'
+   verificato come lo vocalizzi Chatterbox: da controllare in ascolto, e in
+   caso togliere via `eccezioni.json`.
 
-## Prossimo passo: assemblaggio M4B
+## Rigenerazione mirata: perché scavalca la cache
 
-Scrivi `assembla_m4b.py` che:
+`--solo-id ch13_0207,ch07_0044` (o `@file`) e `--solo-sospetti` limitano la corsa
+a quegli id **e ignorano la cache per loro**. Le due cose devono andare insieme:
+se la cache restasse attiva il comando non farebbe niente, perché la firma di
+quei segmenti non è cambiata.
 
-1. Legge `manifest.jsonl` (prodotto da `tts_chatterbox.py`), ordinato per `id`.
-2. Concatena i WAV con `ffmpeg concat demuxer`, inserendo silenzio tra
-   segmenti: 300ms normale, 800ms se `fine_paragrafo=true` nel manifest,
-   1200ms a cambio capitolo.
-3. Codifica in AAC, mono, ~48-64kbps (voce, non serve di più). I WAV escono già
-   a 24kHz (`S3GEN_SR = 24000` in `chatterbox/models/s3gen/const.py`), quindi non
-   c'è nessun resampling da 48kHz da fare: tenere 24kHz e basta.
-4. Genera capitoli FFMETADATA da `chapter` + `titolo` nel manifest, con
-   timestamp calcolati dalla durata cumulativa dei segmenti.
-5. Applica metadata ID3/M4B: titolo libro, autore, narratore ("Chatterbox IT,
-   voce clonata"), copertina se presente nell'EPUB (`epub_to_jsonl.py` non la
-   estrae ancora: aggiungere).
-6. Verifica finale: durata totale del file contro somma delle durate nel
-   manifest, tolleranza 1%. Se fuori tolleranza, segnala invece di procedere
-   silenziosamente.
+È il punto: la firma copre testo più parametri, quindi intercetta il caso "il
+testo era sbagliato" ma non il caso "la generazione è venuta male". Con
+`temperature=0.6` la sintesi è stocastica e lo stesso identico input può uscire
+bene o troncato. Quello serve poterlo ritirare, anche più volte di seguito.
 
-Segmenti con `sospetto: true` nel manifest: non bloccare l'assemblaggio, ma
-stampare un riepilogo a fine corsa con id e testo, per revisione manuale
-prima di considerare il libro finito.
+Il ripiego senza questi flag era `-c N --force`, che rigenera l'intero capitolo:
+oltre al tempo, ritira i dadi anche sui segmenti già buoni e può peggiorarli.
+`-c N` da solo invece non fa nulla, perché il filtro per capitolo agisce prima
+del controllo di cache.
+
+## Assemblaggio M4B: com'e' stato risolto
+
+`assembla_m4b.py` legge `manifest.jsonl`, concatena con il concat demuxer di
+ffmpeg inserendo i silenzi (300 / 800 / 1200 ms), codifica in AAC mono a 24kHz
+e scrive capitoli e metadata. Uso in `README.md`.
+
+Quattro punti in cui l'implementazione si discosta dalla specifica iniziale, e
+il perché:
+
+- **`titolo` e `fine_paragrafo` non erano nel manifest.** La specifica li dava
+  per presenti, ma `tts_chatterbox.py` non li scriveva. Ora li ricopia dal
+  JSONL (non entrano nella `firma`, quindi non invalidano la cache). Per i
+  manifest generati prima c'e' il fallback `--jsonl libro.jsonl`, e senza
+  nessuna delle due fonti lo script si ferma con un messaggio esplicito.
+- **Niente resampling.** I WAV escono gia' a 24kHz
+  (`S3GEN_SR = 24000` in `chatterbox/models/s3gen/const.py`), quindi il
+  "48kHz -> 24kHz" della specifica non aveva oggetto.
+- **La tolleranza dell'1% si misura su parlato + pause.** Confrontare la durata
+  del file con la sola somma delle `durata` del manifest darebbe sempre errore:
+  su un libro intero i silenzi sono decine di minuti, molto oltre l'1%.
+- **Copertina e metadata li estrae `assembla_m4b.py`, non `epub_to_jsonl.py`.**
+  Con `--epub libro.epub` prende titolo e autore dal Dublin Core e la copertina
+  da `ITEM_COVER`, con fallback su `<meta name="cover">` e poi su un'immagine
+  che si chiami "cover". Cosi' il dato non deve attraversare due file
+  intermedi. Restano sovrascrivibili a mano con `--titolo`, `--autore`,
+  `--copertina`.
+
+I segmenti `sospetto: true` non bloccano l'assemblaggio: vengono elencati a
+fine corsa con id, durata e testo, per la revisione manuale.
 
 ## Convenzioni di stile
 Niente trattini lunghi nel codice generato o nei commenti (preferenza utente

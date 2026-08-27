@@ -4,3 +4,8 @@ references/*
 *.epub
 *.jsonl
 __pycache__
+
+# output della pipeline: WAV per segmento, M4B, prove di ascolto
+audio_*/
+*.m4b
+*.wav
