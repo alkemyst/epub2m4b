@@ -9,3 +9,4 @@ __pycache__
 audio_*/
 *.m4b
 *.wav
+output/
