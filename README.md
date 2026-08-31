@@ -22,6 +22,7 @@ segmento e l'altro. E' un rinvio consapevole, vedi `CLAUDE.md`.
 | `epub_to_jsonl.py` | EPUB -> JSONL di segmenti di testo |
 | `tts_chatterbox.py` | JSONL -> un WAV per segmento, riprendibile |
 | `assembla_m4b.py` | WAV + manifest -> M4B con capitoli e copertina |
+| `sommario.py` | struttura del libro: quanto dura ogni capitolo |
 
 `eccezioni.json` e' il dizionario di respelling, applicato prima della sintesi.
 
@@ -393,6 +394,58 @@ il tag che fa comparire il file come audiolibro invece che come musica.
 
 **Nota:** manca ancora la normalizzazione di loudness, quindi il volume puo'
 variare fra un segmento e l'altro. E' un rinvio consapevole, non un bug.
+
+## Controllare la struttura del libro
+
+`sommario.py` stampa un capitolo per riga con durata, posizione e peso sul
+totale. Funziona su due sorgenti:
+
+```bash
+python sommario.py libro.m4b                      # a cose fatte, legge i capitoli col ffprobe
+python sommario.py audio_libro/manifest.jsonl     # prima di codificare, stima dalle durate
+```
+
+```
+ cap  titolo        inizio   durata      %   segm   sosp
+--------------------------------------------------------
+   5  Capitolo 1      0:00    22:17  30.9%    120
+   6  Capitolo 2     22:17    25:30  35.4%    140      7
+   7  Capitolo 3     47:47    22:06  30.7%    130      5
+   8  Epilogo      1:09:53     2:09   3.0%     12      1  <-- corto
+--------------------------------------------------------
+4 capitoli, totale 1:12:02 (1.20 h), mediana 22:17
+402 segmenti, parlato 1:09:27 + pause 2:35
+13 segmenti sospetti, 3.2% del totale
+```
+
+Dal manifest escono anche le colonne `segm` e `sosp` (segmenti e sospetti per
+capitolo), utili per capire **dove** si concentrano i problemi invece di sapere
+solo quanti sono. Dal M4B escono in piu' titolo, autore e bitrate reale.
+
+I capitoli molto fuori dalla mediana sono marcati `<-- corto` o `<-- lungo`. Il
+confronto e' con la mediana e non con la media, perche' bastano un paio di
+capitoli sbagliati per spostare la media e non far notare piu' niente. Non e'
+un errore di per se': un epilogo corto e' normale. E' un errore se un capitolo
+di narrativa dura un decimo degli altri, di solito perche' la sintesi si e'
+interrotta li' o perche' del front matter e' finito dentro.
+
+`--csv` stampa le stesse righe separate da punto e virgola, per aprirle altrove.
+
+La durata dal manifest e' una stima: somma le durate dei WAV piu' le pause che
+`assembla_m4b.py` inserira'. Torna con il file finito a meno di qualche
+decimo. Per i confini dei capitoli senza stampare la tabella c'e' anche
+`assembla_m4b.py --dry-run`, che pero' non guarda ne' segmenti ne' sospetti.
+
+### CPU o GPU?
+
+La codifica e' **tutta CPU**, e non c'e' niente da guadagnare a spostarla. La
+GPU accelera il video (NVENC), non l'audio: un encoder AAC su GPU non esiste.
+Non serve comunque: AAC mono a 24kHz gira a circa 200 volte il tempo reale.
+Misurato qui, 30 minuti di audio codificati in 8.5 secondi, quindi un libro da
+12 ore sono un paio di minuti. Il grosso del lavoro di `assembla_m4b.py` non e'
+nemmeno l'encoder, e' leggere migliaia di WAV dal disco.
+
+La GPU serve al passo 2, la sintesi, che e' l'unica parte che dura ore.
 
 ## Setup da zero
 

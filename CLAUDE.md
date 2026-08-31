@@ -20,6 +20,9 @@ capitoli lunghi.
 - `assembla_m4b.py`: manifest + WAV -> M4B con capitoli, copertina e metadata
   (funzionante, provato su audio sintetico). Ha `--dry-run` per vedere i confini
   dei capitoli senza codificare.
+- `sommario.py`: struttura del libro, un capitolo per riga con durata e posizione
+  (funzionante). Legge un M4B via ffprobe oppure un `manifest.jsonl`; dal manifest
+  dà anche segmenti e sospetti per capitolo. Marca i capitoli fuori dalla mediana.
 - `eccezioni.json`: dizionario respelling (ADHD -> "addì accadì", ecc.), applicato prima della sintesi.
   `-e` è ripetibile: più file si fondono nell'ordine e l'ultimo vince sui doppioni,
   così un vocabolario generale (accenti delle parole comuni) e uno per libro
@@ -192,6 +195,13 @@ il perché:
 
 I segmenti `sospetto: true` non bloccano l'assemblaggio: vengono elencati a
 fine corsa con id, durata e testo, per la revisione manuale.
+
+**La codifica è tutta CPU, e va bene così.** La GPU accelera il video (NVENC),
+non l'audio: un encoder AAC su GPU non esiste, e non servirebbe. AAC mono 24kHz
+gira a circa 200x il tempo reale, misurato: 30 minuti di audio in 8.5 secondi,
+quindi un libro da 12 ore sono un paio di minuti. Il collo di bottiglia di
+`assembla_m4b.py` è la lettura di migliaia di WAV, non l'encoder. La GPU serve
+solo al passo 2.
 
 ## Convenzioni di stile
 Niente trattini lunghi nel codice generato o nei commenti (preferenza utente
