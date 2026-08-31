@@ -15,11 +15,15 @@ capitoli lunghi.
   da solo in pasto al TTS produce troncamenti.
 - `tts_chatterbox.py`: JSONL -> WAV per segmento + manifest.jsonl riprendibile (funzionante).
   Il manifest porta anche `titolo` e `fine_paragrafo`, che servono all'assemblaggio.
-  `--solo-id` e `--solo-sospetti` rigenerano singoli segmenti scavalcando la cache.
+  `--solo-id` e `--solo-sospetti` rigenerano singoli segmenti scavalcando la cache,
+  `--rivaluta` ricalcola i flag `sospetto` senza rigenerare audio.
 - `assembla_m4b.py`: manifest + WAV -> M4B con capitoli, copertina e metadata
   (funzionante, provato su audio sintetico). Ha `--dry-run` per vedere i confini
   dei capitoli senza codificare.
-- `eccezioni.json`: dizionario respelling (ADHD -> "addì accadì", ecc.), applicato prima della sintesi
+- `eccezioni.json`: dizionario respelling (ADHD -> "addì accadì", ecc.), applicato prima della sintesi.
+  `-e` è ripetibile: più file si fondono nell'ordine e l'ultimo vince sui doppioni,
+  così un vocabolario generale (accenti delle parole comuni) e uno per libro
+  (nomi propri, sigle) convivono senza copiare regole. `--senza-eccezioni` li spegne tutti.
 - `README.md`: comandi per girare la conversione, dall'EPUB all'M4B
 - Normalizzazione di loudness: **rinviata**, vedi "Cosa manca"
 - Controllo qualità automatico (Whisper su ogni segmento): **da scrivere**
@@ -82,15 +86,65 @@ quanto pesano sul risultato.
    solo un'euristica su durata attesa contro durata reale.
 5. Segmenti brevi: restano una sessantina di battute di dialogo sotto i 10
    caratteri (`- Eh?`). Sono corrette e non vanno accorpate, ma sono il caso
-   peggiore per Chatterbox: da tenere d'occhio nel QC.
+   peggiore per Chatterbox: da tenere d'occhio nel QC. Non sono piu' falsi
+   positivi automatici dell'euristica, vedi "Il flag sospetto".
 
 **Igiene**
 
-6. `eccezioni.json` e' unico e globale, mentre il respelling e' per libro
-   (nomi propri, sigle). Andrebbe affiancato un file per titolo.
+6. ~~`eccezioni.json` unico e globale~~: fatto, `-e` è ripetibile e i dizionari
+   si fondono. Vedi "Dizionari di respelling".
 7. Il trattino di dialogo negli EPUB italiani e' spesso un en dash. Non e'
    verificato come lo vocalizzi Chatterbox: da controllare in ascolto, e in
    caso togliere via `eccezioni.json`.
+
+## Dizionari di respelling: perché più file e non uno
+
+`-e` è ripetibile, i file si fondono nell'ordine dato e a parità di chiave vince
+l'ultimo. Serve perché i respelling sono di due nature diverse: quelli che
+valgono per la lingua (`"tempo": "tèmpo"`, un vocabolario che si scrive una
+volta e si riusa) e quelli che valgono per un libro solo (nomi dei personaggi,
+sigle). Tenerli in un file unico obbligherebbe a copiare il vocabolario grande
+per ogni titolo. L'ultimo che vince permette al file del libro di correggere una
+voce di quello generale senza toccarlo.
+
+Due dettagli dell'applicazione, in `applica()`:
+
+- **chiavi più lunghe per prime.** Fra `AD` e `ADHD` deve vincere la più
+  specifica, non quella che capita prima nell'iterazione del dizionario.
+- **chiave minuscola = anche a inizio frase.** `"tempo"` prende anche `Tempo` e
+  restituisce `Tèmpo`. Senza questo, in un vocabolario di parole comuni si
+  perderebbe un'occorrenza ogni poche righe. Le chiavi che contengono già una
+  maiuscola restano esatte, altrimenti `ADHD` catturerebbe `adhd`.
+- la sostituzione passa per una lambda invece che per la stringa di rimpiazzo:
+  così backslash e `\1` nel valore restano letterali e non li interpreta `re.sub`.
+
+Cambiare dizionari non invalida la cache di tutto: la firma copre il testo **dopo**
+il respelling, quindi si rigenerano solo i segmenti che cambiano davvero.
+
+## Il flag sospetto: perché aveva dei falsi positivi permanenti
+
+L'euristica era `attesa = len(testo)/14` con finestra `[0.6, 1.8] * attesa`.
+Sui testi corti la finestra è più stretta della variabilità fisiologica del TTS:
+`- Eh?` ammetteva `[0.21, 0.64]` secondi, ma Chatterbox mette sempre attacco e
+coda di silenzio e quella battuta esce sui 0.9s. Risultato: le sessanta battute
+brevi erano sospette **per costruzione**, non uscivano mai dalla lista per
+quante volte le rigenerassi, e facevano sembrare che il flag non si togliesse.
+
+Ora `attesa = OVERHEAD + len(testo)/CPS` (0.4s + caratteri/14) con un margine
+assoluto di 0.5s per parte e un pavimento di 0.25s sotto il quale è sospetto
+comunque. Tutto in `valuta()`, una funzione sola usata sia in scrittura che da
+`--solo-sospetti`.
+
+Il flag **si toglie da solo**: il manifest è in append e vince l'ultima riga per
+id, quindi una rigenerazione riuscita sovrascrive `sospetto: true`. Quello che
+non si aggiorna da solo è il flag già scritto quando cambiano le soglie. Da qui
+`--rivaluta`: ricalcola da testo e durata salvati nel manifest e riscrive solo i
+flag cambiati, senza toccare la GPU. `--solo-sospetti` invece ricalcola sempre
+al volo, così un cambio di euristica vale subito; `--rivaluta` serve perché
+`assembla_m4b.py` legge il flag salvato.
+
+Resta un'euristica sulla sola durata: vede i troncamenti, non le allucinazioni
+a durata giusta. Il QC con Whisper resta da scrivere.
 
 ## Rigenerazione mirata: perché scavalca la cache
 

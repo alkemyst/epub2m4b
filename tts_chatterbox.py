@@ -1,19 +1,92 @@
 #!/usr/bin/env python3
 """Genera un WAV per segmento da un JSONL. Riprendibile."""
-import json, hashlib, argparse, warnings, sys
+import json, hashlib, argparse, warnings, sys, re
 from pathlib import Path
 import torchaudio as ta
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 warnings.filterwarnings("ignore")
 
-def carica_eccezioni(path: Path) -> dict:
-    return json.loads(path.read_text()) if path and path.exists() else {}
+# Euristica sul sospetto: durata attesa contro durata reale. Una parte fissa
+# (attacco, respiro, coda di silenzio che Chatterbox mette sempre) piu' una
+# parte proporzionale al testo.
+OVERHEAD = 0.4      # secondi di contorno, indipendenti dalla lunghezza
+CPS = 14.0          # caratteri al secondo di parlato
+MARGINE = 0.5       # tolleranza assoluta, in secondi
+MINIMA = 0.25       # sotto questa durata e' sospetto comunque
+
+def valuta(testo: str, durata: float) -> bool:
+    """True se la durata non torna con la lunghezza del testo.
+
+    La parte fissa e il margine assoluto servono ai segmenti brevi. Con la sola
+    proporzione, "- Eh?" ha una finestra di [0.21, 0.64] secondi: nessuna
+    generazione reale ci sta dentro, quindi resterebbe sospetto per sempre
+    qualunque cosa esca dal TTS, e ogni --solo-sospetti se lo ritroverebbe.
+
+    Resta un'euristica: vede i troncamenti grossi, non le allucinazioni a
+    durata giusta. Per quelle serve il QC con Whisper, ancora da scrivere.
+    """
+    attesa = OVERHEAD + len(testo) / CPS
+    return (durata < max(MINIMA, attesa * 0.6 - MARGINE)
+            or durata > attesa * 1.8 + MARGINE)
+
+def carica_eccezioni(percorsi: list, obbligatori: bool) -> dict:
+    """Fonde piu' dizionari di respelling nell'ordine dato.
+
+    A parita' di chiave vince l'ultimo file, cosi' si puo' tenere un vocabolario
+    generale (gli accenti delle parole comuni) e sovrascriverne qualche voce con
+    un file specifico del libro, senza copiare regole da un file all'altro.
+
+    obbligatori=False vale per il solo default: se eccezioni.json non c'e' si
+    procede senza respelling invece di fermarsi.
+    """
+    ecc = {}
+    for p in percorsi:
+        if not p.exists():
+            if obbligatori:
+                sys.exit(f"errore: dizionario non trovato: {p}")
+            continue
+        try:
+            d = json.loads(p.read_text())
+        except json.JSONDecodeError as e:
+            sys.exit(f"errore: {p} non e' JSON valido: {e}")
+        if not isinstance(d, dict):
+            sys.exit(f"errore: {p} deve contenere un oggetto, "
+                     f"non {type(d).__name__}")
+        doppie = sorted(set(d) & set(ecc))
+        print(f"  {p}: {len(d)} regol{'a' if len(d) == 1 else 'e'}"
+              + (f", {len(doppie)} sovrascriv"
+                 f"{'e' if len(doppie) == 1 else 'ono'} le precedenti"
+                 if doppie else ""))
+        if doppie:
+            print("    " + ", ".join(doppie[:8]) + (" ..." if len(doppie) > 8 else ""))
+        ecc.update(d)
+    return ecc
+
+def maiuscola(s: str) -> str:
+    """Come str.capitalize() ma senza abbassare il resto della stringa."""
+    return s[:1].upper() + s[1:]
 
 def applica(testo: str, ecc: dict) -> str:
-    import re
-    for k, v in ecc.items():
-        testo = re.sub(rf"\b{re.escape(k)}\b", v, testo)
+    """Applica il respelling sul confine di parola.
+
+    Due dettagli che contano con un vocabolario grande:
+
+    - le chiavi piu' lunghe vanno per prime, cosi' fra due regole che si
+      sovrappongono vince la piu' specifica e non quella che capita prima;
+    - una chiave tutta minuscola vale anche a inizio frase, dove la parola e'
+      maiuscola. Senza questo, in un vocabolario di parole comuni verrebbe
+      saltata una occorrenza ogni poche righe. Le chiavi che contengono gia'
+      una maiuscola (ADHD, Macchiavelli) restano invece esatte.
+    """
+    for k in sorted(ecc, key=len, reverse=True):
+        v = ecc[k]
+        # sostituzione via lambda: cosi' backslash e \1 nel valore restano
+        # letterali invece di essere interpretati da re.sub
+        testo = re.sub(rf"\b{re.escape(k)}\b", lambda _m, v=v: v, testo)
+        if k.islower():
+            testo = re.sub(rf"\b{re.escape(maiuscola(k))}\b",
+                           lambda _m, v=maiuscola(v): v, testo)
     return testo
 
 def carica_ids(spec: str) -> set:
@@ -44,7 +117,12 @@ def main():
     p.add_argument("jsonl", type=Path)
     p.add_argument("-o", "--outdir", type=Path, default=Path("audio"))
     p.add_argument("-r", "--ref", default="references/ref_stefano_buendia.wav")
-    p.add_argument("-e", "--eccezioni", type=Path, default=Path("eccezioni.json"))
+    p.add_argument("-e", "--eccezioni", type=Path, action="append", default=None,
+                   help="dizionario di respelling, ripetibile: i file si "
+                        "fondono nell'ordine e l'ultimo vince sui doppioni "
+                        "(default: eccezioni.json)")
+    p.add_argument("--senza-eccezioni", action="store_true",
+                   help="nessun respelling, ignora anche il default")
     p.add_argument("--exaggeration", type=float, default=0.65)
     p.add_argument("--cfg-weight", type=float, default=0.5)
     p.add_argument("--temperature", type=float, default=0.6)
@@ -57,11 +135,30 @@ def main():
                    help="rigenera solo questi id ignorando la cache: lista "
                         "separata da virgole, oppure @file")
     p.add_argument("--solo-sospetti", action="store_true",
-                   help="rigenera gli id marcati sospetto nel manifest")
+                   help="rigenera gli id sospetti secondo il manifest")
+    p.add_argument("--rivaluta", action="store_true",
+                   help="ricalcola il flag sospetto sull'audio gia' prodotto e "
+                        "aggiorna il manifest, senza rigenerare niente")
     args = p.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    ecc = carica_eccezioni(args.eccezioni)
+
+    if args.senza_eccezioni:
+        if args.eccezioni:
+            sys.exit("errore: --senza-eccezioni e -e si escludono a vicenda")
+        ecc = {}
+        print("respelling disattivato")
+    else:
+        # senza -e vale il default, e se manca si tira dritto senza respelling;
+        # con -e i file sono stati chiesti esplicitamente, quindi devono esserci
+        espliciti = bool(args.eccezioni)
+        percorsi = args.eccezioni if espliciti else [Path("eccezioni.json")]
+        print("dizionari di respelling:")
+        ecc = carica_eccezioni(percorsi, espliciti)
+        if not ecc:
+            print("  nessuno, il testo va in sintesi cosi' com'e'")
+        elif len(percorsi) > 1:
+            print(f"  totale: {len(ecc)} regole")
 
     cfg = {
         "exaggeration": args.exaggeration,
@@ -83,12 +180,35 @@ def main():
                 r = json.loads(l)
                 fatti[r["id"]] = r        # ultima riga per id: le rigenerazioni vincono
 
+    if args.rivaluta:
+        if not manifest_path.exists():
+            sys.exit(f"errore: manifest non trovato: {manifest_path}\n"
+                     "--rivaluta lavora sui risultati di una corsa precedente")
+        # Il flag scritto nel manifest e' quello calcolato dalla corsa che ha
+        # generato il segmento: se le soglie cambiano, resta indietro. Qui lo
+        # ricalcoliamo da testo e durata gia' salvati, senza toccare l'audio.
+        cambiate = [r for r in fatti.values()
+                    if bool(r.get("sospetto")) != valuta(r["text"], r["durata"])]
+        if not cambiate:
+            print(f"{len(fatti)} segmenti nel manifest, nessun flag da correggere")
+            return
+        with manifest_path.open("a") as mf:
+            for r in cambiate:
+                r["sospetto"] = valuta(r["text"], r["durata"])
+                mf.write(json.dumps(r, ensure_ascii=False) + "\n")
+        promossi = sum(1 for r in cambiate if r["sospetto"])
+        print(f"{len(fatti)} segmenti nel manifest, {len(cambiate)} flag corretti: "
+              f"{len(cambiate) - promossi} non piu' sospetti, {promossi} ora sospetti")
+        return
+
     selezione = carica_ids(args.solo_id) if args.solo_id else set()
     if args.solo_sospetti:
         if not manifest_path.exists():
             sys.exit(f"errore: manifest non trovato: {manifest_path}\n"
                      "--solo-sospetti lavora sui risultati di una corsa precedente")
-        sospetti = {i for i, r in fatti.items() if r.get("sospetto")}
+        # non ci fidiamo del flag salvato: lo ricalcoliamo con le soglie di
+        # adesso, cosi' un cambio di euristica vale subito senza --rivaluta
+        sospetti = {i for i, r in fatti.items() if valuta(r["text"], r["durata"])}
         if not sospetti:
             sys.exit(f"errore: nessun segmento sospetto in {manifest_path}")
         print(f"--solo-sospetti: {len(sospetti)} id presi dal manifest")
@@ -142,8 +262,7 @@ def main():
             ta.save(str(out), wav, model.sr)
 
             durata = wav.shape[-1] / model.sr
-            attesa = len(testo) / 14.0          # circa 14 caratteri al secondo
-            sospetto = durata < attesa * 0.6 or durata > attesa * 1.8
+            sospetto = valuta(testo, durata)
 
             mf.write(json.dumps({
                 "id": s["id"],

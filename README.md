@@ -129,8 +129,8 @@ Flag utili:
 
 ### Respelling
 
-`eccezioni.json` e' un dizionario `parola -> come va letta`, applicato prima
-della sintesi con un match su confine di parola:
+Un dizionario di respelling e' un JSON `parola -> come va letta`, applicato al
+testo prima della sintesi con un match su confine di parola:
 
 ```json
 {
@@ -139,8 +139,37 @@ della sintesi con un match su confine di parola:
 }
 ```
 
-Va rivisto per ogni libro: quello nel repo e' rimasto dal titolo precedente.
-Tipicamente serve per sigle, nomi propri e forestierismi.
+Il respelling si applica al passo 2, non qui: e' `tts_chatterbox.py` a leggere i
+dizionari. Sta in questa sezione perche' si ragiona sul testo.
+
+**Piu' dizionari insieme.** `-e` e' ripetibile e i file si fondono nell'ordine,
+cosi' si separa quello che vale per tutti i libri da quello che vale per uno:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o audio_libro \
+    -e dizionari/accenti_it.json \
+    -e dizionari/sigle.json \
+    -e dizionari/buendia.json
+```
+
+A parita' di chiave **vince l'ultimo file**, quindi il dizionario del libro puo'
+correggere una voce di quello generale senza ricopiarlo. Le sovrascritture
+vengono elencate al lancio, cosi' un doppione non passa inosservato.
+
+Senza `-e` vale il default `eccezioni.json`, e se non c'e' si tira dritto senza
+respelling. Con `-e` i file sono stati chiesti apposta, quindi se uno manca lo
+script si ferma. `--senza-eccezioni` disattiva tutto, default compreso.
+
+Due regole di applicazione, che contano quando il dizionario e' grande:
+
+- le chiavi piu' lunghe vanno per prime, cosi' fra `AD` e `ADHD` vince la piu'
+  specifica invece di quella che capita prima;
+- una chiave **tutta minuscola** vale anche a inizio frase, dove la parola e'
+  maiuscola: `"tempo": "tèmpo"` prende anche `Tempo` e scrive `Tèmpo`. Le chiavi
+  che contengono gia' una maiuscola (`ADHD`, `Macchiavelli`) restano esatte.
+
+Cambiare dizionari non rigenera tutto: la firma di cache copre il testo dopo il
+respelling, quindi si rifanno solo i segmenti che cambiano davvero.
 
 ## Passo 2: JSONL -> WAV
 
@@ -174,14 +203,16 @@ Flag utili:
 |---|---|---|
 | `-o`, `--outdir` | `audio` | cartella di uscita, ci finisce anche `manifest.jsonl` |
 | `-r`, `--ref` | `references/ref_stefano_buendia.wav` | voce da clonare |
-| `-e`, `--eccezioni` | `eccezioni.json` | dizionario di respelling |
+| `-e`, `--eccezioni` | `eccezioni.json` | dizionario di respelling, ripetibile |
+| `--senza-eccezioni` | | nessun respelling, ignora anche il default |
 | `--exaggeration` | 0.65 | espressivita' |
 | `--cfg-weight` | 0.5 | aderenza al riferimento |
 | `--temperature` | 0.6 | varianza |
 | `-c`, `--chapter` | tutti | genera solo questo capitolo |
 | `-n`, `--limite` | nessuno | genera al massimo N segmenti |
 | `--solo-id` | | rigenera solo questi id, scavalcando la cache |
-| `--solo-sospetti` | | rigenera gli id marcati `sospetto` nel manifest |
+| `--solo-sospetti` | | rigenera gli id sospetti secondo il manifest |
+| `--rivaluta` | | ricalcola i flag `sospetto` senza rigenerare audio |
 | `--force` | | rigenera tutto ignorando il manifest |
 
 ### Ripresa e cache
@@ -201,17 +232,43 @@ rigenerazione. Vince l'ultima riga: e' voluto, tiene la storia dei tentativi.
 
 ### Segmenti sospetti
 
-`sospetto: true` marca un segmento la cui durata si discosta troppo da quella
-attesa dal numero di caratteri (sotto il 60% o sopra il 180%). In corsa
-compaiono come `<-- CONTROLLA`. Di solito e' un troncamento: Chatterbox chiude
-la frase in anticipo. Per contarli a fine corsa:
+`sospetto: true` marca un segmento la cui durata reale non torna con quella
+attesa dal testo. L'attesa e' `0.4s + caratteri/14`: la parte fissa e' il
+contorno che Chatterbox mette sempre (attacco, respiro, coda di silenzio). La
+finestra ammessa va dal 60% al 180% dell'attesa, piu' mezzo secondo di
+tolleranza per parte. In corsa compaiono come `<-- CONTROLLA`. Di solito e' un
+troncamento: Chatterbox chiude la frase in anticipo. Per contarli:
 
 ```bash
 grep -c '"sospetto": true' audio_libro/manifest.jsonl
 ```
 
+La parte fissa e la tolleranza assoluta servono ai segmenti brevi. Con la sola
+proporzione, `- Eh?` avrebbe una finestra di `[0.21, 0.64]` secondi: nessuna
+generazione reale ci sta dentro, quindi le battute di dialogo corte
+risulterebbero sospette per sempre, comunque venga l'audio.
+
+Resta un'euristica sulla sola durata: vede i troncamenti grossi, non le
+allucinazioni che durano il giusto. Per quelle serve il QC con Whisper, ancora
+da scrivere.
+
 Se ce ne sono molti, la contromisura sarebbe alzare `repetition_penalty` a
 2.2-2.5, ma quel parametro **non e' ancora esposto** dallo script.
+
+**Il flag si toglie da solo.** Il manifest e' in append e vince l'ultima riga
+per id, quindi se una rigenerazione viene bene il segmento smette di essere
+sospetto senza dover fare niente. Quello che non si aggiorna da solo e' il flag
+dei segmenti gia' prodotti quando le soglie cambiano: e' scritto nel manifest,
+non ricalcolato. Per allinearlo senza rigenerare un secondo di audio:
+
+```bash
+python tts_chatterbox.py libro.jsonl -o audio_libro --rivaluta
+```
+
+Legge testo e durata dal manifest, ricalcola i flag con le soglie di adesso e
+scrive solo quelli cambiati. `--solo-sospetti` ricalcola comunque per conto suo,
+quindi non ha bisogno che tu lanci prima `--rivaluta`: serve perche'
+`assembla_m4b.py` legge il flag salvato.
 
 ### Rifare i segmenti venuti male
 
@@ -238,6 +295,12 @@ Per lavorare sull'intera lista dei sospetti senza copiarla a mano:
 ```bash
 python tts_chatterbox.py libro.jsonl -o audio_libro --solo-sospetti
 ```
+
+Rilanciandolo la lista si accorcia: quelli venuti bene escono dal conteggio. Se
+invece si allunga fra una corsa e l'altra, in mezzo e' girata una sintesi
+normale che ha prodotto segmenti nuovi, `--solo-sospetti` da solo non ne puo'
+aggiungere. E se un segmento non esce mai dalla lista per quante volte lo
+ritiri, prima di insistere ascoltalo: probabile sia buono e falso positivo.
 
 Se la lista e' lunga e vuoi sceglierne solo alcuni, `--solo-id` accetta anche un
 file, dove il cancelletto commenta fino a fine riga:
